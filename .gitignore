@@ -25,3 +25,6 @@
 # Ignore key files for decrypting credentials and more.
 /config/*.key
 
+
+# ビルド時に取り込む（定義の正本は元リポジトリ kuchikomi-ai-multi-stack）
+/db/bootstrap/*.sql

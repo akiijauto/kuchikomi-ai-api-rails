@@ -1,0 +1,154 @@
+name: CI
+
+# このリポジトリは「クチコミ返信AI」のAPIを Ruby on Rails（APIモード）で実装したもの。
+# テーブル定義の正本はここには置かず、元リポジトリ（kuchikomi-ai-multi-stack）の
+# web/supabase/schema.sql のままにしてある。Rails のマイグレーションも持たない。
+# 同じ定義に複数言語の実装を載せるのが主旨で、定義を複製すると
+# 「どちらが正なのか」が分からなくなるため。CI は毎回その正本を取りに行く。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SCHEMA_BASE: https://raw.githubusercontent.com/akiijauto/kuchikomi-ai-multi-stack/main
+
+jobs:
+  rspec:
+    name: RSpec（正本のスキーマに対して）
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kuchikomi
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/kuchikomi
+      RAILS_ENV: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: 定義の正本を取得して流し込む
+        # 素の PostgreSQL には auth スキーマも auth.uid() も無いので、
+        # 互換シムを先に流してから本体のスキーマを流す（元リポジトリと同じ順序）。
+        run: |
+          curl -fsSL "$SCHEMA_BASE/db/init/00_supabase_compat.sql" -o /tmp/00_compat.sql
+          curl -fsSL "$SCHEMA_BASE/web/supabase/schema.sql"        -o /tmp/10_schema.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/00_compat.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/10_schema.sql
+          psql "$DATABASE_URL" -tAc "select count(*) from information_schema.tables \
+            where table_schema='public' and table_name in ('profiles','usage_logs','plan_limits');" \
+            | grep -qx 3
+
+      - name: 自動読み込みの検査
+        run: bundle exec rails zeitwerk:check
+
+      - name: RSpec
+        run: bundle exec rspec --format documentation
+
+  container:
+    name: コンテナの起動確認（デモ画面まで通るか）
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kuchikomi
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: スキーマ定義をビルドコンテキストへ取り込む
+        # 本番と同じ経路にする。RDSは外部から接続できないため、psqlで流すのではなく
+        # コンテナ自身に流させる（LOAD_SCHEMA=1）。SQLの正本は複製せずここへ置くだけ。
+        run: |
+          mkdir -p db/bootstrap
+          curl -fsSL "$SCHEMA_BASE/db/init/00_supabase_compat.sql" -o db/bootstrap/00_supabase_compat.sql
+          curl -fsSL "$SCHEMA_BASE/web/supabase/schema.sql"        -o db/bootstrap/10_schema.sql
+          ls -l db/bootstrap
+
+      - uses: docker/setup-buildx-action@v3
+      - name: イメージをビルド
+        env:
+          DOCKER_BUILD_SUMMARY: "false"
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: kuchikomi-rails:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 起動する（TLS終端が無い構成なのでSSL強制は切る）
+        run: |
+          # ポート80は使わない。イメージは非rootで動くため、ホストネットワークでは
+          # 1024未満を掴めない。Thrusterの待ち受けを8080に、その先のRailsを3000にずらす。
+          docker run -d --name rails --network host \
+            -e RAILS_ENV=production \
+            -e RAILS_FORCE_SSL=false \
+            -e DEMO_MODE=1 \
+            -e LOAD_SCHEMA=1 \
+            -e HTTP_PORT=8080 \
+            -e TARGET_PORT=3000 \
+            -e SECRET_KEY_BASE=$(openssl rand -hex 32) \
+            -e SUPABASE_JWT_SECRET=ci-demo-secret \
+            -e DATABASE_URL=postgresql://postgres:postgres@localhost:5432/kuchikomi \
+            kuchikomi-rails:ci
+          # 待ちループは必ず「起動しなかった」で落ちるように書く
+          # （`curl || sleep` だけだと最後のsleepが成功して緑になる）
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:8080/api/health; then echo; exit 0; fi
+            sleep 2
+          done
+          echo "80秒待っても応答なし。ログ:"; docker logs rails; exit 1
+
+      - name: 非rootで動いているか
+        run: test "$(docker exec rails id -u)" != "0"
+
+      - name: デモ画面が配信されるか
+        run: curl -fsS http://localhost:8080/demo.html | grep -q "Rails API デモ"
+
+      - name: デモ用トークンを受け取り、生成まで通るか
+        run: |
+          # 日本語の本文はUTF-8のファイルに書いてから --data-binary で送る
+          printf '%s' '{"review":{"reviewText":"スープが本当に美味しかったです","rating":5}}' > body.json
+          TOKEN=$(curl -fsS -X POST http://localhost:8080/api/demo/token | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+          BODY=$(curl -fsS -X POST http://localhost:8080/api/generate \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            --data-binary @body.json)
+          echo "$BODY" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert len(d['replies']) == 3, d
+          assert d['usage']['used'] == 1, d
+          print('返信案', len(d['replies']), '件 / 利用', d['usage'])
+          "
+
+      - name: 認証なしでは拒否されるか
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/api/generate \
+            -H "Content-Type: application/json" -d '{"review":{"reviewText":"test review","rating":5}}')
+          test "$code" = "401" || { echo "401ではなく $code"; exit 1; }
+
+      - name: 失敗時のログ
+        if: failure()
+        run: docker logs rails || true
+      - name: 後片付け
+        if: always()
+        run: docker rm -f rails || true
