@@ -54,13 +54,24 @@ class ReplyGenerator
     text_block = message.content.find { |block| block.type == :text }
     raise "生成結果が空でした" if text_block.nil?
 
-    replies = JSON.parse(text_block.text).fetch("replies")
+    payload = JSON.parse(text_block.text)
+    replies = payload["replies"] if payload.is_a?(Hash)
+    unless payload.is_a?(Hash) && payload.keys == ["replies"] && valid_replies?(replies)
+      raise "生成結果の形式が不正でした"
+    end
     Result.new(replies: with_signature(replies), mock: false)
   end
 
   private
 
   attr_reader :profile, :review_text, :rating
+
+  def valid_replies?(replies)
+    replies.is_a?(Array) && replies.size == 3 && replies.all? do |reply|
+      reply.is_a?(Hash) && reply.keys.sort == %w[label text] &&
+        %w[label text].all? { |key| reply[key].is_a?(String) && !reply[key].strip.empty? }
+    end
+  end
 
   def client
     @client ||= Anthropic::Client.new

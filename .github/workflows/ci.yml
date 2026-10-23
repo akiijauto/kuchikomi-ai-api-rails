@@ -57,6 +57,9 @@ jobs:
       - name: RSpec
         run: bundle exec rspec --format documentation
 
+      - name: 返信出力の契約（SDK fake・外部通信なし）
+        run: bundle exec ruby -Itest -r ./test/pdca_reply_contract_test.rb ./test/pdca_reply_output_test.rb
+
   container:
     name: コンテナの起動確認（デモ画面まで通るか）
     runs-on: ubuntu-latest
