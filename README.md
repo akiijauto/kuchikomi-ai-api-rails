@@ -195,3 +195,6 @@ DATABASE_URL=postgresql://... bundle exec rspec --format documentation
 ## ライセンス
 
 MIT License（[LICENSE](LICENSE)）
+
+## 返信出力の検証（PDCA-300-001 cycle059）
+構造化出力も3案/label/textの型・非空を検証してから署名を付与します。`ruby -Itest -r ./test/pdca_reply_contract_test.rb ./test/pdca_reply_output_test.rb`でSDKfakeの関連17件を実行できます。旧固定12失敗→新17成功、既存Ruby/Minitestのみで追加依存なし。CIにも同じstepを追加。実AI/SDK/API/DB/Rails/課金は使わず、既存RSpec14件やHTTP全体の成功とは区別します。詳細は要件定義.md/振り返り.md。
